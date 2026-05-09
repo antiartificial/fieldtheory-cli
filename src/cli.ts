@@ -635,7 +635,7 @@ function printIdeasRunReport(summary: import('./ideas.js').IdeasRunSummary): voi
 
 /** Per-invocation LLM engine override (bypasses saved default, fails fast). */
 export function engineOption(): Option {
-  return new Option('--engine <name>', 'Override the LLM engine for this run (e.g. claude, codex)');
+  return new Option('--engine <name>', 'Override the LLM engine for this run (e.g. claude, codex, xai)');
 }
 
 /** Wrap an async action with graceful error handling. */
@@ -1237,7 +1237,7 @@ export function buildCli() {
 
   program
     .command('classify')
-    .description('Classify bookmarks by category and domain using LLM (requires claude or codex CLI)')
+    .description('Classify bookmarks by category and domain using LLM (requires claude/codex CLI or XAI_API_KEY)')
     .option('--regex', 'Use simple regex classification instead of LLM')
     .addOption(engineOption())
     .action(safe(async (options) => {
@@ -1307,7 +1307,7 @@ export function buildCli() {
   program
     .command('model')
     .description('View or change the default LLM engine for classification')
-    .argument('[engine]', 'Set default engine directly (e.g. claude, codex)')
+    .argument('[engine]', 'Set default engine directly (e.g. claude, codex, xai)')
     .action(safe(async (engineArg?: string) => {
       const available = detectAvailableEngines();
       const prefs = loadPreferences();
@@ -1317,6 +1317,7 @@ export function buildCli() {
         console.log('  Install one of:');
         console.log('    - Claude Code: https://docs.anthropic.com/en/docs/claude-code');
         console.log('    - Codex CLI:   https://github.com/openai/codex');
+        console.log('    - xAI API:     set XAI_API_KEY');
         return;
       }
 
@@ -1769,7 +1770,7 @@ export function buildCli() {
     .option('--repos <path...>', 'Multiple repo paths; produces one consideration per repo plus a batch summary')
     .option('--frame <id>', 'Frame id (overrides any frame pinned on the seed)')
     .option('--depth <depth>', 'Depth: quick | standard | deep (default: standard, or quick under --defaults)')
-    .option('--engine <name>', 'LLM CLI engine for this run (claude | codex; default comes from ft model/autodetect)')
+    .option('--engine <name>', 'LLM engine for this run (claude | codex | xai; default comes from ft model/autodetect)')
     .option('--model <name>', 'Model alias/name passed to the engine (for example opus or gpt-5.5)')
     .option('--effort <level>', 'Reasoning effort passed to the engine (low | medium | high | xhigh | max)')
     .option('--weight <level>', 'Alias for --effort', undefined)
@@ -1931,7 +1932,7 @@ export function buildCli() {
     .option('--repos <path...>', 'Multiple repo paths')
     .option('--frame <id>', 'Frame id (defaults to seed-pinned frame or leverage-specificity)')
     .option('--depth <depth>', 'Depth: quick | standard | deep', 'quick')
-    .option('--engine <name>', 'LLM CLI engine for this run (claude | codex)')
+    .option('--engine <name>', 'LLM engine for this run (claude | codex | xai)')
     .option('--model <name>', 'Model alias/name passed to the engine')
     .option('--effort <level>', 'Reasoning effort passed to the engine')
     .option('--weight <level>', 'Alias for --effort', undefined)

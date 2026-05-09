@@ -14,12 +14,17 @@ import { PromptCancelledError, promptText } from './prompt.js';
 // ── Engine registry ────────────────────────────────────────────────────
 
 export interface EngineConfig {
-  bin: string;
-  args: (prompt: string, engine?: Pick<ResolvedEngine, 'model' | 'effort'>) => string[];
+  type?: 'command' | 'openai-compatible';
+  bin?: string;
+  args?: (prompt: string, engine?: Pick<ResolvedEngine, 'model' | 'effort'>) => string[];
+  envKey?: string;
+  baseUrl?: string;
+  defaultModel?: string;
 }
 
 const KNOWN_ENGINES: Record<string, EngineConfig> = {
   claude: {
+    type: 'command',
     bin: 'claude',
     args: (p, engine) => [
       '-p',
@@ -31,6 +36,7 @@ const KNOWN_ENGINES: Record<string, EngineConfig> = {
     ],
   },
   codex: {
+    type: 'command',
     bin: 'codex',
     args: (p, engine) => [
       'exec',
@@ -40,10 +46,16 @@ const KNOWN_ENGINES: Record<string, EngineConfig> = {
       p,
     ],
   },
+  xai: {
+    type: 'openai-compatible',
+    envKey: 'XAI_API_KEY',
+    baseUrl: 'https://api.x.ai/v1',
+    defaultModel: 'grok-4-fast',
+  },
 };
 
 /** Order used when auto-detecting. */
-const PREFERENCE_ORDER = ['claude', 'codex'];
+const PREFERENCE_ORDER = ['claude', 'codex', 'xai'];
 
 // ── Detection ──────────────────────────────────────────────────────────
 
@@ -82,7 +94,7 @@ export function hasCommandOnPath(
 }
 
 export function detectAvailableEngines(): string[] {
-  return PREFERENCE_ORDER.filter((name) => hasCommandOnPath(KNOWN_ENGINES[name].bin));
+  return PREFERENCE_ORDER.filter((name) => isEngineAvailable(name));
 }
 
 // ── Interactive prompt ─────────────────────────────────────────────────
@@ -126,6 +138,26 @@ function cleanOptional(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function engineAvailabilityError(name: string): string | null {
+  const config = KNOWN_ENGINES[name];
+  if (!config) return `Unknown engine "${name}".`;
+  if ((config.type ?? 'command') === 'openai-compatible') {
+    const envKey = config.envKey ?? '';
+    if (!envKey || !cleanOptional(process.env[envKey])) {
+      return `Engine "${name}" requires ${envKey} to be set.`;
+    }
+    return null;
+  }
+  if (!config.bin || !hasCommandOnPath(config.bin)) {
+    return `Engine "${name}" is not on PATH.`;
+  }
+  return null;
+}
+
+function isEngineAvailable(name: string): boolean {
+  return engineAvailabilityError(name) === null;
+}
+
 function formatEngineLabel(input: { name: string; model?: string; effort?: string }): string {
   const model = cleanOptional(input.model);
   const effort = cleanOptional(input.effort);
@@ -141,11 +173,16 @@ export function describeEngine(engine: Pick<ResolvedEngine, 'name' | 'model' | '
 }
 
 function resolve(name: string, profile: EngineRunProfile = {}): ResolvedEngine {
-  const model = cleanOptional(profile.model);
+  const config = KNOWN_ENGINES[name];
+  const model = cleanOptional(profile.model) ?? (
+    (config.type ?? 'command') === 'openai-compatible'
+      ? config.defaultModel
+      : undefined
+  );
   const effort = cleanOptional(profile.effort);
   return {
     name,
-    config: KNOWN_ENGINES[name],
+    config,
     model,
     effort,
     label: formatEngineLabel({ name, model, effort }),
@@ -176,14 +213,15 @@ export async function resolveEngine(profile: EngineRunProfile = {}): Promise<Res
       const known = Object.keys(KNOWN_ENGINES).join(', ');
       throw new Error(`Unknown engine "${requestedEngine}". Known engines: ${known}.`);
     }
-    if (!hasCommandOnPath(KNOWN_ENGINES[requestedEngine].bin)) {
+    const availabilityError = engineAvailabilityError(requestedEngine);
+    if (availabilityError) {
       const available = detectAvailableEngines();
       const hint = available.length > 0
-        ? ` Available on PATH: ${available.join(', ')}.`
+        ? ` Available engines: ${available.join(', ')}.`
         : '';
       throw new Error(
-        `Engine "${requestedEngine}" is not on PATH.${hint}\n` +
-        `Install it and log in, or pick a different engine.`
+        `${availabilityError}${hint}\n` +
+        `Install it, log in, set the required API key, or pick a different engine.`
       );
     }
     return resolve(requestedEngine, profile);
@@ -194,9 +232,10 @@ export async function resolveEngine(profile: EngineRunProfile = {}): Promise<Res
   if (available.length === 0) {
     throw new Error(
       'No supported LLM CLI found.\n' +
-      'Install one of the following and log in:\n' +
+      'Install one of the following and log in, or set XAI_API_KEY:\n' +
       '  - Claude Code: https://docs.anthropic.com/en/docs/claude-code\n' +
-      '  - Codex CLI:   https://github.com/openai/codex'
+      '  - Codex CLI:   https://github.com/openai/codex\n' +
+      '  - xAI API:     https://docs.x.ai/docs/guides/chat-completions'
     );
   }
 
@@ -346,6 +385,113 @@ function buildMessage(
   }
 }
 
+function openAiCompatiblePayload(engine: ResolvedEngine, prompt: string): Record<string, unknown> {
+  return {
+    model: engine.model ?? engine.config.defaultModel,
+    stream: false,
+    messages: [
+      { role: 'user', content: prompt },
+    ],
+  };
+}
+
+function parseOpenAiCompatibleResponse(raw: string, engineName: string): string {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new EngineInvocationError({
+      engine: engineName,
+      bin: engineName,
+      stderr: redactSecrets(raw.slice(-STDERR_TAIL_BYTES)),
+      killed: false,
+      code: 0,
+      signal: null,
+      reason: 'exit',
+      message: buildMessage(engineName, 'exit', redactSecrets(raw.slice(-STDERR_TAIL_BYTES)), 0, null, DEFAULT_TIMEOUT),
+    });
+  }
+
+  const content = parsed?.choices?.[0]?.message?.content;
+  if (typeof content === 'string' && content.trim()) return content.trim();
+
+  const errorMessage = typeof parsed?.error?.message === 'string'
+    ? parsed.error.message
+    : 'OpenAI-compatible response did not include choices[0].message.content';
+  throw new EngineInvocationError({
+    engine: engineName,
+    bin: engineName,
+    stderr: redactSecrets(errorMessage),
+    killed: false,
+    code: 0,
+    signal: null,
+    reason: 'exit',
+    message: buildMessage(engineName, 'exit', redactSecrets(errorMessage), 0, null, DEFAULT_TIMEOUT),
+  });
+}
+
+const OPENAI_COMPATIBLE_SYNC_SCRIPT = `
+const chunks = [];
+process.stdin.on('data', (chunk) => chunks.push(chunk));
+process.stdin.on('end', async () => {
+  try {
+    const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const apiKey = process.env[input.envKey];
+    if (!apiKey) {
+      process.stderr.write(input.envKey + ' is not set');
+      process.exit(2);
+      return;
+    }
+    const response = await fetch(input.url, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(input.payload),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      process.stderr.write(text);
+      process.exit(1);
+      return;
+    }
+    process.stdout.write(text);
+  } catch (err) {
+    process.stderr.write(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+});
+`;
+
+function openAiCompatibleSyncInput(engine: ResolvedEngine, prompt: string): string {
+  const envKey = engine.config.envKey ?? '';
+  const baseUrl = engine.config.baseUrl ?? '';
+  return JSON.stringify({
+    envKey,
+    url: `${baseUrl.replace(/\/$/, '')}/chat/completions`,
+    payload: openAiCompatiblePayload(engine, prompt),
+  });
+}
+
+function requireApiKey(engine: ResolvedEngine): string {
+  const envKey = engine.config.envKey ?? '';
+  const apiKey = cleanOptional(process.env[envKey]);
+  if (!apiKey) {
+    throw new EngineInvocationError({
+      engine: engine.name,
+      bin: engine.name,
+      stderr: '',
+      killed: false,
+      code: null,
+      signal: null,
+      reason: 'spawn',
+      message: `${engine.name} requires ${envKey} to be set`,
+    });
+  }
+  return apiKey;
+}
+
 /**
  * Synchronous engine call — uses `spawnSync` with `input: ''` so the child's
  * stdin is closed with EOF before it starts reading.
@@ -357,9 +503,58 @@ function buildMessage(
  * EOF immediately so the child proceeds with just the prompt arg.
  */
 export function invokeEngine(engine: ResolvedEngine, prompt: string, opts: InvokeOptions = {}): string {
-  const { bin, args } = engine.config;
   const timeout   = opts.timeout   ?? DEFAULT_TIMEOUT;
   const maxBuffer = opts.maxBuffer ?? DEFAULT_MAXBUF;
+
+  if ((engine.config.type ?? 'command') === 'openai-compatible') {
+    requireApiKey(engine);
+    const result = spawnSync(process.execPath, ['-e', OPENAI_COMPATIBLE_SYNC_SCRIPT], {
+      input: openAiCompatibleSyncInput(engine, prompt),
+      timeout,
+      maxBuffer,
+      encoding: 'buffer',
+    });
+    const stderrBuf = result.stderr ?? Buffer.alloc(0);
+    const stdoutBuf = result.stdout ?? Buffer.alloc(0);
+    const stderr = redactSecrets(tailString(Buffer.concat([stderrBuf, stdoutBuf]), STDERR_TAIL_BYTES));
+
+    if (result.error) {
+      const anyErr = result.error as NodeJS.ErrnoException & { code?: string };
+      const reason = anyErr.code === 'ETIMEDOUT' ? 'timeout' : 'spawn';
+      throw new EngineInvocationError({
+        engine: engine.name,
+        bin: process.execPath,
+        stderr,
+        killed: reason === 'timeout',
+        code: null,
+        signal: reason === 'timeout' ? 'SIGTERM' : null,
+        reason,
+        message: buildMessage(engine.name, reason, stderr || anyErr.message || '', null, reason === 'timeout' ? 'SIGTERM' : null, timeout),
+      });
+    }
+    if (result.status !== 0) {
+      throw new EngineInvocationError({
+        engine: engine.name, bin: process.execPath, stderr,
+        killed: false, code: result.status, signal: result.signal, reason: 'exit',
+        message: buildMessage(engine.name, 'exit', stderr, result.status, result.signal, timeout),
+      });
+    }
+    return parseOpenAiCompatibleResponse(stdoutBuf.toString('utf-8'), engine.name);
+  }
+
+  const { bin, args } = engine.config;
+  if (!bin || !args) {
+    throw new EngineInvocationError({
+      engine: engine.name,
+      bin: engine.name,
+      stderr: '',
+      killed: false,
+      code: null,
+      signal: null,
+      reason: 'spawn',
+      message: `${engine.name} is missing command configuration`,
+    });
+  }
 
   const result = spawnSync(bin, args(prompt, engine), {
     input: '',              // EOF on stdin — do not inherit parent stdin
@@ -424,9 +619,26 @@ export function invokeEngine(engine: ResolvedEngine, prompt: string, opts: Invok
  * `spawn` we get direct control and can `child.stdin.end()` immediately.
  */
 export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: InvokeOptions = {}): Promise<string> {
-  const { bin, args } = engine.config;
   const timeout   = opts.timeout   ?? DEFAULT_TIMEOUT;
   const maxBuffer = opts.maxBuffer ?? DEFAULT_MAXBUF;
+
+  if ((engine.config.type ?? 'command') === 'openai-compatible') {
+    return invokeOpenAiCompatibleAsync(engine, prompt, timeout);
+  }
+
+  const { bin, args } = engine.config;
+  if (!bin || !args) {
+    return Promise.reject(new EngineInvocationError({
+      engine: engine.name,
+      bin: engine.name,
+      stderr: '',
+      killed: false,
+      code: null,
+      signal: null,
+      reason: 'spawn',
+      message: `${engine.name} is missing command configuration`,
+    }));
+  }
 
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args(prompt, engine), {
@@ -535,4 +747,59 @@ export function invokeEngineAsync(engine: ResolvedEngine, prompt: string, opts: 
       }));
     });
   });
+}
+
+async function invokeOpenAiCompatibleAsync(
+  engine: ResolvedEngine,
+  prompt: string,
+  timeout: number,
+): Promise<string> {
+  const apiKey = requireApiKey(engine);
+  const baseUrl = engine.config.baseUrl ?? '';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(openAiCompatiblePayload(engine, prompt)),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      const stderr = redactSecrets(text.slice(-STDERR_TAIL_BYTES));
+      throw new EngineInvocationError({
+        engine: engine.name,
+        bin: engine.name,
+        stderr,
+        killed: false,
+        code: response.status,
+        signal: null,
+        reason: 'exit',
+        message: buildMessage(engine.name, 'exit', stderr || response.statusText, response.status, null, timeout),
+      });
+    }
+    return parseOpenAiCompatibleResponse(text, engine.name);
+  } catch (err) {
+    if (err instanceof EngineInvocationError) throw err;
+    const isAbort = err instanceof Error && err.name === 'AbortError';
+    throw new EngineInvocationError({
+      engine: engine.name,
+      bin: engine.name,
+      stderr: '',
+      killed: isAbort,
+      code: null,
+      signal: isAbort ? 'SIGTERM' : null,
+      reason: isAbort ? 'timeout' : 'spawn',
+      message: isAbort
+        ? buildMessage(engine.name, 'timeout', '', null, 'SIGTERM', timeout)
+        : buildMessage(engine.name, 'spawn', err instanceof Error ? err.message : String(err), null, null, timeout),
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }

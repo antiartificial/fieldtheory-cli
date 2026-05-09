@@ -74,7 +74,7 @@ test('detectAvailableEngines: returns array of available engines', async () => {
 
   // Each entry should be a known engine name
   for (const name of available) {
-    assert.ok(['claude', 'codex'].includes(name), `unexpected engine: ${name}`);
+    assert.ok(['claude', 'codex', 'xai'].includes(name), `unexpected engine: ${name}`);
   }
 });
 
@@ -174,6 +174,40 @@ test('resolveEngine: carries explicit model and effort into engine args', async 
   }
 });
 
+test('resolveEngine: xai uses XAI_API_KEY and defaults to grok-4-fast', async () => {
+  const origXaiKey = process.env.XAI_API_KEY;
+  process.env.XAI_API_KEY = 'xai-test-key';
+
+  try {
+    const { resolveEngine } = await import('../src/engine.js');
+    const resolved = await resolveEngine({ engine: 'xai' });
+
+    assert.equal(resolved.name, 'xai');
+    assert.equal(resolved.model, 'grok-4-fast');
+    assert.equal(resolved.label, 'xai/grok-4-fast');
+  } finally {
+    if (origXaiKey === undefined) delete process.env.XAI_API_KEY;
+    else process.env.XAI_API_KEY = origXaiKey;
+  }
+});
+
+test('resolveEngine: xai model can be overridden', async () => {
+  const origXaiKey = process.env.XAI_API_KEY;
+  process.env.XAI_API_KEY = 'xai-test-key';
+
+  try {
+    const { resolveEngine } = await import('../src/engine.js');
+    const resolved = await resolveEngine({ engine: 'xai', model: 'grok-4-fast-reasoning' });
+
+    assert.equal(resolved.name, 'xai');
+    assert.equal(resolved.model, 'grok-4-fast-reasoning');
+    assert.equal(resolved.label, 'xai/grok-4-fast-reasoning');
+  } finally {
+    if (origXaiKey === undefined) delete process.env.XAI_API_KEY;
+    else process.env.XAI_API_KEY = origXaiKey;
+  }
+});
+
 // ── resolveEngine with single engine ───────────────────────────────────
 
 test('resolveEngine: single available engine is used without prompting', async () => {
@@ -236,6 +270,22 @@ test('resolveEngine: override fails fast when binary not on PATH', async () => {
   } finally {
     process.env.PATH = origPath;
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('resolveEngine: xai requires XAI_API_KEY', async () => {
+  const origXaiKey = process.env.XAI_API_KEY;
+  delete process.env.XAI_API_KEY;
+
+  try {
+    const { resolveEngine } = await import('../src/engine.js');
+    await assert.rejects(
+      () => resolveEngine({ override: 'xai' }),
+      /requires XAI_API_KEY/,
+    );
+  } finally {
+    if (origXaiKey === undefined) delete process.env.XAI_API_KEY;
+    else process.env.XAI_API_KEY = origXaiKey;
   }
 });
 

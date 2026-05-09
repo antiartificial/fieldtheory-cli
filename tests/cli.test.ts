@@ -113,6 +113,13 @@ test('ft wiki: description mentions engine prerequisite', () => {
   assert.ok(desc.includes('claude') && desc.includes('codex'));
 });
 
+test('ft classify: description mentions xai option', () => {
+  const program = buildCli();
+  const classifyCmd = program.commands.find((c: any) => c.name() === 'classify');
+  assert.ok(classifyCmd);
+  assert.ok(classifyCmd.description().toLowerCase().includes('xai'));
+});
+
 test('ft path: prints only the data directory', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ft-path-'));
   const origEnv = process.env.FT_DATA_DIR;
