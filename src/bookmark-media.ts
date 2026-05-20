@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { writeFile } from 'node:fs/promises';
+import { readdir, writeFile } from 'node:fs/promises';
 import { ensureDir, pathExists, readJson, readJsonLines, writeJson } from './fs.js';
 import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksCachePath } from './paths.js';
 import type { BookmarkRecord } from './types.js';
@@ -261,6 +261,18 @@ export async function fetchBookmarkMediaBatch(
   const entriesByKey = new Map((previous?.entries ?? []).map((entry) => [mediaEntryKeyFromEntry(entry), entry]));
   const cachedResultsBySourceUrl = new Map<string, CachedMediaResult>();
 
+  const existingFiles = await readdir(mediaDir);
+  const existingDigestIndex = new Map<string, string>();
+  for (const name of existingFiles) {
+    const dashIdx = name.indexOf('-');
+    const dotIdx = name.lastIndexOf('.');
+    if (dashIdx !== -1 && dotIdx > dashIdx) {
+      existingDigestIndex.set(name.slice(dashIdx + 1), path.join(mediaDir, name));
+    } else if (dotIdx !== -1) {
+      existingDigestIndex.set(name, path.join(mediaDir, name));
+    }
+  }
+
   let downloaded = 0;
   let skippedTooLarge = 0;
   let failed = 0;
@@ -426,11 +438,16 @@ export async function fetchBookmarkMediaBatch(
 
         const digest = createHash('sha256').update(buffer).digest('hex').slice(0, 16);
         const ext = sanitizeExtFromContentType(response.headers.get('content-type') ?? contentType ?? undefined, sourceUrl);
+        const digestKey = `${digest}${ext}`;
+        const existingPath = existingDigestIndex.get(digestKey);
         const filename = isProfileImage
-          ? `${digest}${ext}`
-          : `${tweetId}-${digest}${ext}`;
-        const localPath = path.join(mediaDir, filename);
-        await writeFile(localPath, buffer);
+          ? digestKey
+          : `${tweetId}-${digestKey}`;
+        const localPath = existingPath ?? path.join(mediaDir, filename);
+        if (!existingPath) {
+          await writeFile(localPath, buffer);
+          existingDigestIndex.set(digestKey, localPath);
+        }
         if (isProfileImage) coveredProfileImageUrls.add(sourceUrl);
         else coveredAssetKeys.add(key);
 
