@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -701,5 +701,179 @@ test('fetchBookmarkMediaBatch with skipProfileImages excludes pfp-only bookmarks
     });
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchBookmarkMediaBatch uploads to R2 and deletes local files after successful upload', async () => {
+  const photoUrl = 'https://pbs.twimg.com/media/r2-photo.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'r2 media test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    mediaObjects: [{ type: 'photo', url: photoUrl }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  const uploadedUrls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  const savedEnv = {
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+    R2_PUBLIC_BASE_URL: process.env.R2_PUBLIC_BASE_URL,
+    R2_PREFIX: process.env.R2_PREFIX,
+  };
+
+  process.env.R2_ACCOUNT_ID = 'acct';
+  process.env.R2_BUCKET = 'bucket';
+  process.env.R2_ACCESS_KEY_ID = 'access';
+  process.env.R2_SECRET_ACCESS_KEY = 'secret';
+  process.env.R2_PUBLIC_BASE_URL = 'https://cdn.example.test/media';
+  process.env.R2_PREFIX = 'bookmarks';
+
+  globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url = String(input instanceof Request ? input.url : input);
+    const method = init?.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': '4', 'content-type': 'image/jpeg' },
+      });
+    }
+    if (method === 'PUT') {
+      uploadedUrls.push(url);
+      assert.ok(init?.headers && 'authorization' in (init.headers as Record<string, string>));
+      return new Response(null, { status: 200 });
+    }
+    return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      const manifest = await fetchBookmarkMediaBatch({
+        limit: 10,
+        maxBytes: 1024,
+        uploadR2: true,
+        deleteLocalAfterUpload: true,
+      });
+      const entry = manifest.entries.find((e) => e.sourceUrl === photoUrl);
+
+      assert.equal(manifest.uploaded, 1);
+      assert.equal(manifest.deletedLocal, 1);
+      assert.equal(entry?.status, 'downloaded');
+      assert.equal(entry?.localPath, undefined);
+      assert.match(entry?.r2Key ?? '', /^bookmarks\/1-[a-f0-9]{16}\.jpg$/);
+      assert.match(entry?.r2Url ?? '', /^https:\/\/cdn\.example\.test\/media\/bookmarks\/1-[a-f0-9]{16}\.jpg$/);
+      assert.equal(uploadedUrls.length, 1);
+
+      const mediaDirEntries = await readFile(path.join(process.env.FT_DATA_DIR!, 'media-manifest.json'), 'utf8');
+      assert.match(mediaDirEntries, /"r2Key"/);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('fetchBookmarkMediaBatch treats local-only manifest entries as pending in R2 mode', async () => {
+  const photoUrl = 'https://pbs.twimg.com/media/local-only.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'local only r2 test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    mediaObjects: [{ type: 'photo', url: photoUrl }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  let putCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const savedEnv = {
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+    R2_PREFIX: process.env.R2_PREFIX,
+  };
+
+  process.env.R2_ACCOUNT_ID = 'acct';
+  process.env.R2_BUCKET = 'bucket';
+  process.env.R2_ACCESS_KEY_ID = 'access';
+  process.env.R2_SECRET_ACCESS_KEY = 'secret';
+  process.env.R2_PREFIX = 'bookmarks';
+
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': '4', 'content-type': 'image/jpeg' },
+      });
+    }
+    if (method === 'PUT') {
+      putCalls += 1;
+      return new Response(null, { status: 200 });
+    }
+    return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      await writeFile(path.join(process.env.FT_DATA_DIR!, 'media-manifest.json'), JSON.stringify({
+        schemaVersion: 1,
+        generatedAt: '2026-04-09T00:00:00.000Z',
+        limit: 1,
+        maxBytes: 1024,
+        processed: 1,
+        downloaded: 1,
+        uploaded: 0,
+        deletedLocal: 0,
+        skippedTooLarge: 0,
+        failed: 0,
+        entries: [{
+          bookmarkId: '1',
+          tweetId: '1',
+          tweetUrl: 'https://x.com/alice/status/1',
+          sourceUrl: photoUrl,
+          localPath: '/tmp/local-only.jpg',
+          contentType: 'image/jpeg',
+          bytes: 4,
+          status: 'downloaded',
+          fetchedAt: '2026-04-09T00:00:00.000Z',
+        }],
+      }));
+
+      const manifest = await fetchBookmarkMediaBatch({ limit: 10, maxBytes: 1024, uploadR2: true });
+      assert.equal(manifest.uploaded, 1);
+      assert.equal(putCalls, 1);
+      assert.match(manifest.entries.find((e) => e.sourceUrl === photoUrl)?.r2Key ?? '', /^bookmarks\/1-[a-f0-9]{16}\.jpg$/);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });

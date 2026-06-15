@@ -1,6 +1,6 @@
 import path from 'node:path';
-import { createHash } from 'node:crypto';
-import { readdir, writeFile } from 'node:fs/promises';
+import { createHash, createHmac } from 'node:crypto';
+import { readdir, rm, writeFile } from 'node:fs/promises';
 import { ensureDir, pathExists, readJson, readJsonLines, writeJson } from './fs.js';
 import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksCachePath } from './paths.js';
 import type { BookmarkRecord } from './types.js';
@@ -15,6 +15,8 @@ export interface MediaFetchEntry {
   authorName?: string;
   sourceUrl: string;
   localPath?: string;
+  r2Key?: string;
+  r2Url?: string;
   contentType?: string;
   bytes?: number;
   status: 'downloaded' | 'skipped_too_large' | 'failed';
@@ -31,6 +33,8 @@ export interface MediaFetchManifest {
   downloaded: number;
   skippedTooLarge: number;
   failed: number;
+  uploaded: number;
+  deletedLocal: number;
   entries: MediaFetchEntry[];
 }
 
@@ -38,6 +42,8 @@ export interface MediaFetchProgress {
   candidateBookmarks: number;
   processed: number;
   downloaded: number;
+  uploaded: number;
+  deletedLocal: number;
   skippedTooLarge: number;
   failed: number;
   currentSourceUrl?: string;
@@ -65,11 +71,23 @@ interface MediaTargetSource {
 
 interface CachedMediaResult {
   localPath?: string;
+  r2Key?: string;
+  r2Url?: string;
   contentType?: string;
   bytes?: number;
   status: MediaFetchEntry['status'];
   reason?: string;
   fetchedAt: string;
+}
+
+interface R2UploadConfig {
+  accountId: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  endpoint: string;
+  publicBaseUrl?: string;
+  prefix: string;
 }
 
 function mediaEntryKey(tweetId: string, sourceUrl: string, isProfileImage: boolean): string {
@@ -91,6 +109,84 @@ function sanitizeExtFromContentType(contentType?: string, sourceUrl?: string): s
     if (ext) return ext;
   } catch {}
   return '.bin';
+}
+
+function resolveR2Config(): R2UploadConfig {
+  const accountId = process.env.R2_ACCOUNT_ID;
+  const bucket = process.env.R2_BUCKET;
+  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+  if (!accountId || !bucket || !accessKeyId || !secretAccessKey) {
+    throw new Error('R2 upload requires R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY');
+  }
+  const endpoint = (process.env.R2_ENDPOINT ?? `https://${accountId}.r2.cloudflarestorage.com`).replace(/\/+$/, '');
+  const prefix = (process.env.R2_PREFIX ?? 'fieldtheory/bookmarks/media').replace(/^\/+|\/+$/g, '');
+  return {
+    accountId,
+    bucket,
+    accessKeyId,
+    secretAccessKey,
+    endpoint,
+    publicBaseUrl: process.env.R2_PUBLIC_BASE_URL?.replace(/\/+$/, ''),
+    prefix,
+  };
+}
+
+function hmac(key: Buffer | string, value: string): Buffer {
+  return createHmac('sha256', key).update(value).digest();
+}
+
+function encodeS3PathPart(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function encodeS3Key(key: string): string {
+  return key.split('/').map(encodeS3PathPart).join('/');
+}
+
+async function uploadToR2(config: R2UploadConfig, key: string, body: Buffer, contentType?: string): Promise<string> {
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = createHash('sha256').update(body).digest('hex');
+  const encodedKey = encodeS3Key(key);
+  const url = new URL(`${config.endpoint}/${encodeS3PathPart(config.bucket)}/${encodedKey}`);
+  const host = url.host;
+  const headers: Record<string, string> = {
+    host,
+    'x-amz-content-sha256': payloadHash,
+    'x-amz-date': amzDate,
+  };
+  if (contentType) headers['content-type'] = contentType;
+
+  const signedHeaderNames = Object.keys(headers).sort();
+  const canonicalHeaders = signedHeaderNames.map((name) => `${name}:${headers[name]}\n`).join('');
+  const signedHeaders = signedHeaderNames.join(';');
+  const canonicalRequest = [
+    'PUT',
+    url.pathname,
+    '',
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join('\n');
+  const credentialScope = `${dateStamp}/auto/s3/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    createHash('sha256').update(canonicalRequest).digest('hex'),
+  ].join('\n');
+  const signingKey = hmac(hmac(hmac(hmac(`AWS4${config.secretAccessKey}`, dateStamp), 'auto'), 's3'), 'aws4_request');
+  const signature = createHmac('sha256', signingKey).update(stringToSign).digest('hex');
+  headers.authorization = `AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const response = await fetch(url, { method: 'PUT', headers, body: new Uint8Array(body) });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`R2 upload failed HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`);
+  }
+  return config.publicBaseUrl ? `${config.publicBaseUrl}/${encodedKey}` : url.toString();
 }
 
 async function loadManifest(): Promise<MediaFetchManifest | null> {
@@ -202,26 +298,26 @@ function resolveMediaTargets(
   return targets;
 }
 
-function isCoveredEntry(entry: MediaFetchEntry, maxBytes: number): boolean {
-  if (entry.status === 'downloaded') return true;
+function isCoveredEntry(entry: MediaFetchEntry, maxBytes: number, requireR2: boolean): boolean {
+  if (entry.status === 'downloaded') return requireR2 ? Boolean(entry.r2Key) : true;
   if (entry.status !== 'skipped_too_large') return false;
   return typeof entry.bytes === 'number' && !Number.isNaN(entry.bytes) && entry.bytes > maxBytes;
 }
 
-function buildCoveredAssetKeys(previous: MediaFetchManifest | null, maxBytes: number): Set<string> {
+function buildCoveredAssetKeys(previous: MediaFetchManifest | null, maxBytes: number, requireR2: boolean): Set<string> {
   return new Set(
     (previous?.entries ?? [])
       .filter((entry) => !entry.sourceUrl.includes('/profile_images/'))
-      .filter((entry) => isCoveredEntry(entry, maxBytes))
+      .filter((entry) => isCoveredEntry(entry, maxBytes, requireR2))
       .map((entry) => `${entry.tweetId}::${entry.sourceUrl}`),
   );
 }
 
-function buildCoveredProfileImageUrls(previous: MediaFetchManifest | null, maxBytes: number): Set<string> {
+function buildCoveredProfileImageUrls(previous: MediaFetchManifest | null, maxBytes: number, requireR2: boolean): Set<string> {
   return new Set(
     (previous?.entries ?? [])
       .filter((entry) => entry.sourceUrl.includes('/profile_images/'))
-      .filter((entry) => isCoveredEntry(entry, maxBytes))
+      .filter((entry) => isCoveredEntry(entry, maxBytes, requireR2))
       .map((entry) => entry.sourceUrl),
   );
 }
@@ -239,20 +335,29 @@ function hasPendingMediaTarget(
 }
 
 export async function fetchBookmarkMediaBatch(
-  options: { limit?: number; maxBytes?: number; skipProfileImages?: boolean; onProgress?: (progress: MediaFetchProgress) => void } = {}
+  options: {
+    limit?: number;
+    maxBytes?: number;
+    skipProfileImages?: boolean;
+    uploadR2?: boolean;
+    deleteLocalAfterUpload?: boolean;
+    onProgress?: (progress: MediaFetchProgress) => void;
+  } = {}
 ): Promise<MediaFetchManifest> {
   const limit = typeof options.limit === 'number' && !Number.isNaN(options.limit)
     ? Math.max(0, options.limit)
     : Infinity;
   const maxBytes = options.maxBytes ?? DEFAULT_MEDIA_MAX_BYTES;
   const skipProfileImages = options.skipProfileImages ?? false;
+  const r2Config = options.uploadR2 ? resolveR2Config() : null;
+  const deleteLocalAfterUpload = Boolean(r2Config && options.deleteLocalAfterUpload);
   const mediaDir = bookmarkMediaDir();
   const manifestPath = bookmarkMediaManifestPath();
   await ensureDir(mediaDir);
 
   const previous = await loadManifest();
-  const coveredAssetKeys = buildCoveredAssetKeys(previous, maxBytes);
-  const coveredProfileImageUrls = buildCoveredProfileImageUrls(previous, maxBytes);
+  const coveredAssetKeys = buildCoveredAssetKeys(previous, maxBytes, Boolean(r2Config));
+  const coveredProfileImageUrls = buildCoveredProfileImageUrls(previous, maxBytes, Boolean(r2Config));
   const bookmarks = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
   const candidates = bookmarks
     .filter(hasMediaCandidate)
@@ -274,6 +379,8 @@ export async function fetchBookmarkMediaBatch(
   }
 
   let downloaded = 0;
+  let uploaded = 0;
+  let deletedLocal = 0;
   let skippedTooLarge = 0;
   let failed = 0;
   let processed = 0;
@@ -283,6 +390,8 @@ export async function fetchBookmarkMediaBatch(
       candidateBookmarks: candidates.length,
       processed,
       downloaded,
+      uploaded,
+      deletedLocal,
       skippedTooLarge,
       failed,
       currentSourceUrl,
@@ -308,6 +417,8 @@ export async function fetchBookmarkMediaBatch(
       authorName,
       sourceUrl,
       localPath: cached.localPath,
+      r2Key: cached.r2Key,
+      r2Url: cached.r2Url,
       contentType: cached.contentType,
       bytes: cached.bytes,
       status: cached.status,
@@ -448,6 +559,20 @@ export async function fetchBookmarkMediaBatch(
           await writeFile(localPath, buffer);
           existingDigestIndex.set(digestKey, localPath);
         }
+        let finalLocalPath: string | undefined = localPath;
+        let r2Key: string | undefined;
+        let r2Url: string | undefined;
+        if (r2Config) {
+          r2Key = `${r2Config.prefix}/${filename}`;
+          r2Url = await uploadToR2(r2Config, r2Key, buffer, response.headers.get('content-type') ?? contentType ?? undefined);
+          uploaded += 1;
+          if (deleteLocalAfterUpload) {
+            await rm(localPath, { force: true });
+            finalLocalPath = undefined;
+            existingDigestIndex.delete(digestKey);
+            deletedLocal += 1;
+          }
+        }
         if (isProfileImage) coveredProfileImageUrls.add(sourceUrl);
         else coveredAssetKeys.add(key);
 
@@ -458,7 +583,9 @@ export async function fetchBookmarkMediaBatch(
           authorHandle,
           authorName,
           sourceUrl,
-          localPath,
+          localPath: finalLocalPath,
+          r2Key,
+          r2Url,
           contentType: response.headers.get('content-type') ?? contentType ?? undefined,
           bytes: buffer.byteLength,
           status: 'downloaded',
@@ -466,7 +593,9 @@ export async function fetchBookmarkMediaBatch(
         } satisfies MediaFetchEntry;
         upsertEntry(entry);
         cachedResultsBySourceUrl.set(sourceUrl, {
-          localPath,
+          localPath: finalLocalPath,
+          r2Key,
+          r2Url,
           contentType: entry.contentType,
           bytes: buffer.byteLength,
           status: entry.status,
@@ -508,6 +637,8 @@ export async function fetchBookmarkMediaBatch(
     maxBytes,
     processed,
     downloaded,
+    uploaded,
+    deletedLocal,
     skippedTooLarge,
     failed,
     entries: Array.from(entriesByKey.values()),

@@ -194,6 +194,12 @@ function printMediaFetchSummary(result: MediaFetchManifest): void {
     console.log('  ✓ No pending media assets found');
   }
   console.log(`  ✓ ${result.downloaded} media assets downloaded`);
+  if (result.uploaded > 0) {
+    console.log(`  ✓ ${result.uploaded} media assets uploaded to R2`);
+  }
+  if (result.deletedLocal > 0) {
+    console.log(`  ✓ ${result.deletedLocal} local media files deleted after upload`);
+  }
   if (result.skippedTooLarge > 0) {
     console.log(`  ${result.skippedTooLarge} media assets skipped for size`);
   }
@@ -204,12 +210,20 @@ function printMediaFetchSummary(result: MediaFetchManifest): void {
   console.log(`  ✓ Manifest: ${bookmarkMediaManifestPath()}`);
 }
 
-async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: number; skipProfileImages?: boolean } = {}): Promise<MediaFetchManifest> {
+async function runMediaFetchWithProgress(options: {
+  limit?: number;
+  maxBytes?: number;
+  skipProfileImages?: boolean;
+  uploadR2?: boolean;
+  deleteLocalAfterUpload?: boolean;
+} = {}): Promise<MediaFetchManifest> {
   const startTime = Date.now();
   let lastMedia: MediaFetchProgress = {
     candidateBookmarks: 0,
     processed: 0,
     downloaded: 0,
+    uploaded: 0,
+    deletedLocal: 0,
     skippedTooLarge: 0,
     failed: 0,
   };
@@ -221,6 +235,8 @@ async function runMediaFetchWithProgress(options: { limit?: number; maxBytes?: n
     limit: options.limit,
     maxBytes: options.maxBytes,
     skipProfileImages: options.skipProfileImages,
+    uploadR2: options.uploadR2,
+    deleteLocalAfterUpload: options.deleteLocalAfterUpload,
     onProgress: (progress: MediaFetchProgress) => {
       lastMedia = progress;
       spinner.update();
@@ -739,6 +755,8 @@ export function buildCli() {
     .option('--classify', 'Classify new bookmarks with LLM after syncing', false)
     .option('--no-media', 'Skip downloading media assets after syncing (default: media is downloaded)')
     .option('--media-max-bytes <n>', 'Per-asset byte limit for media downloads (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
+    .option('--media-r2', 'Upload downloaded media assets to Cloudflare R2')
+    .option('--media-delete-local', 'Delete local media files after successful R2 upload')
     .option('--skip-profile-images', 'Skip downloading author profile images', false)
     .option('--max-pages <n>', 'Max pages to fetch (default: unlimited)', (v: string) => Number(v))
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
@@ -797,7 +815,12 @@ export function buildCli() {
           : DEFAULT_MEDIA_MAX_BYTES;
         const postSyncMediaFetch = async (): Promise<void> => {
           if (!downloadMedia) return;
-          await runMediaFetchWithProgress({ maxBytes: mediaMaxBytes, skipProfileImages: Boolean(options.skipProfileImages) });
+          await runMediaFetchWithProgress({
+            maxBytes: mediaMaxBytes,
+            skipProfileImages: Boolean(options.skipProfileImages),
+            uploadR2: Boolean(options.mediaR2),
+            deleteLocalAfterUpload: Boolean(options.mediaDeleteLocal),
+          });
           console.log('');
         };
 
@@ -1510,6 +1533,8 @@ export function buildCli() {
     .description('Download media assets for bookmarks')
     .option('--limit <n>', 'Max pending bookmarks to process (default: all)', (v: string) => Number(v))
     .option('--max-bytes <n>', 'Per-asset byte limit (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
+    .option('--r2', 'Upload downloaded media assets to Cloudflare R2')
+    .option('--delete-local', 'Delete local media files after successful R2 upload')
     .option('--skip-profile-images', 'Skip downloading author profile images')
     .action(safe(async (options) => {
       if (!requireData()) return;
@@ -1519,6 +1544,8 @@ export function buildCli() {
           ? options.maxBytes
           : DEFAULT_MEDIA_MAX_BYTES,
         skipProfileImages: Boolean(options.skipProfileImages),
+        uploadR2: Boolean(options.r2),
+        deleteLocalAfterUpload: Boolean(options.deleteLocal),
       });
     }));
 
