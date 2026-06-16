@@ -17,6 +17,7 @@ const X_PUBLIC_BEARER =
 
 const BOOKMARKS_QUERY_ID = 'Z9GWmP0kP2dajyckAaDUBw';
 const BOOKMARKS_OPERATION = 'Bookmarks';
+const DEFAULT_BOOKMARK_PAGE_FETCH_TIMEOUT_MS = 60_000;
 
 // TweetResultByRestId — used by `--gaps` to re-fetch truncated note_tweets by
 // id. The queryId is hardcoded to match the bookmarks-feed convention; refresh
@@ -415,6 +416,16 @@ class RateLimitError extends Error {
   }
 }
 
+function bookmarkPageFetchTimeoutMs(): number {
+  const raw = Number(process.env.FT_BOOKMARK_PAGE_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return DEFAULT_BOOKMARK_PAGE_FETCH_TIMEOUT_MS;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
 function parseRetryAfterSec(response: Response): number | undefined {
   const retryAfter = response.headers.get('retry-after');
   if (retryAfter) {
@@ -439,9 +450,28 @@ function parseRetryAfterSec(response: Response): number | undefined {
 
 async function fetchPageWithRetry(csrfToken: string, cursor?: string, cookieHeader?: string, pageSize?: number): Promise<PageResult> {
   let lastError: Error | undefined;
+  const timeoutMs = bookmarkPageFetchTimeoutMs();
 
   for (let attempt = 0; attempt < 4; attempt++) {
-    const response = await fetch(buildUrl(cursor, pageSize), { headers: buildHeaders(csrfToken, cookieHeader) });
+    let response: Response;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      response = await fetch(buildUrl(cursor, pageSize), {
+        headers: buildHeaders(csrfToken, cookieHeader),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      lastError = isAbortError(error)
+        ? new Error(`GraphQL Bookmarks API request timed out after ${Math.round(timeoutMs / 1000)}s on attempt ${attempt + 1}`)
+        : error instanceof Error
+          ? new Error(`GraphQL Bookmarks API request failed on attempt ${attempt + 1}: ${error.message}`)
+          : new Error(`GraphQL Bookmarks API request failed on attempt ${attempt + 1}`);
+      await new Promise((r) => setTimeout(r, 5000 * (attempt + 1)));
+      continue;
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (response.status === 429) {
       const retryAfterSec = parseRetryAfterSec(response);
