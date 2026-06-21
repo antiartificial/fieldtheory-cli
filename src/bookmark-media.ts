@@ -365,6 +365,22 @@ export async function fetchBookmarkMediaBatch(
     .slice(0, limit);
   const entriesByKey = new Map((previous?.entries ?? []).map((entry) => [mediaEntryKeyFromEntry(entry), entry]));
   const cachedResultsBySourceUrl = new Map<string, CachedMediaResult>();
+  for (const entry of previous?.entries ?? []) {
+    if (!entry.sourceUrl || entry.sourceUrl.includes('/profile_images/')) continue;
+    if (!isCoveredEntry(entry, maxBytes, Boolean(r2Config))) continue;
+    if (!cachedResultsBySourceUrl.has(entry.sourceUrl)) {
+      cachedResultsBySourceUrl.set(entry.sourceUrl, {
+        localPath: entry.localPath,
+        r2Key: entry.r2Key,
+        r2Url: entry.r2Url,
+        contentType: entry.contentType,
+        bytes: entry.bytes,
+        status: entry.status,
+        reason: entry.reason,
+        fetchedAt: entry.fetchedAt,
+      });
+    }
+  }
 
   const existingFiles = await readdir(mediaDir);
   const existingDigestIndex = new Map<string, string>();
