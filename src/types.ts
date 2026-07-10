@@ -82,6 +82,10 @@ export interface BookmarkRecord {
   media?: string[];
   mediaObjects?: BookmarkMediaObject[];
   links?: string[];
+  categories?: string[];
+  primaryCategory?: string;
+  domains?: string[];
+  primaryDomain?: string;
   tags?: string[];
   ingestedVia?: 'api' | 'browser' | 'graphql';
   /** Parallel arrays of folder IDs and display names this bookmark is in on X. */

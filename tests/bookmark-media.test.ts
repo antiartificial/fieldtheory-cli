@@ -877,3 +877,339 @@ test('fetchBookmarkMediaBatch treats local-only manifest entries as pending in R
     }
   }
 });
+
+test('fetchBookmarkMediaBatch keeps adult media local even when R2 upload is enabled', async () => {
+  const photoUrl = 'https://pbs.twimg.com/media/adult-local.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'adult media test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    primaryCategory: 'adult art',
+    mediaObjects: [{ type: 'photo', url: photoUrl }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  let putCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const savedEnv = {
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+    R2_PREFIX: process.env.R2_PREFIX,
+    FT_MEDIA_LOCAL_ONLY_CATEGORIES: process.env.FT_MEDIA_LOCAL_ONLY_CATEGORIES,
+  };
+
+  process.env.R2_ACCOUNT_ID = 'acct';
+  process.env.R2_BUCKET = 'bucket';
+  process.env.R2_ACCESS_KEY_ID = 'access';
+  process.env.R2_SECRET_ACCESS_KEY = 'secret';
+  process.env.R2_PREFIX = 'bookmarks';
+  delete process.env.FT_MEDIA_LOCAL_ONLY_CATEGORIES;
+
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': '4', 'content-type': 'image/jpeg' },
+      });
+    }
+    if (method === 'PUT') {
+      putCalls += 1;
+      return new Response(null, { status: 200 });
+    }
+    return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      const manifest = await fetchBookmarkMediaBatch({
+        limit: 10,
+        maxBytes: 1024,
+        uploadR2: true,
+        deleteLocalAfterUpload: true,
+      });
+      const entry = manifest.entries.find((e) => e.sourceUrl === photoUrl);
+
+      assert.equal(manifest.uploaded, 0);
+      assert.equal(manifest.deletedLocal, 0);
+      assert.equal(putCalls, 0);
+      assert.equal(entry?.storagePolicy, 'local');
+      assert.equal(entry?.sensitive, true);
+      assert.equal(entry?.r2Key, undefined);
+      assert.equal(entry?.r2Url, undefined);
+      assert.match(entry?.localPath ?? '', /1-[a-f0-9]{16}\.jpg$/);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('fetchBookmarkMediaBatch keeps possiblySensitive media local by default', async () => {
+  const photoUrl = 'https://pbs.twimg.com/media/sensitive-local.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'sensitive media test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    possiblySensitive: true,
+    mediaObjects: [{ type: 'photo', url: photoUrl }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  let putCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const savedEnv = {
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+    FT_MEDIA_LOCAL_ONLY_POSSIBLY_SENSITIVE: process.env.FT_MEDIA_LOCAL_ONLY_POSSIBLY_SENSITIVE,
+  };
+
+  process.env.R2_ACCOUNT_ID = 'acct';
+  process.env.R2_BUCKET = 'bucket';
+  process.env.R2_ACCESS_KEY_ID = 'access';
+  process.env.R2_SECRET_ACCESS_KEY = 'secret';
+  delete process.env.FT_MEDIA_LOCAL_ONLY_POSSIBLY_SENSITIVE;
+
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': '4', 'content-type': 'image/jpeg' },
+      });
+    }
+    if (method === 'PUT') {
+      putCalls += 1;
+      return new Response(null, { status: 200 });
+    }
+    return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      const manifest = await fetchBookmarkMediaBatch({ limit: 10, maxBytes: 1024, uploadR2: true });
+      const entry = manifest.entries.find((e) => e.sourceUrl === photoUrl);
+
+      assert.equal(putCalls, 0);
+      assert.equal(entry?.storagePolicy, 'local');
+      assert.equal(entry?.sensitive, true);
+      assert.equal(entry?.sensitivityReason, 'matched possiblySensitive flag');
+      assert.equal(entry?.r2Key, undefined);
+      assert.ok(entry?.localPath);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('fetchBookmarkMediaBatch repairs adult R2-only entries into local-only references', async () => {
+  const photoUrl = 'https://pbs.twimg.com/media/adult-r2-only.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'adult repair test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    folderNames: ['Adult art'],
+    mediaObjects: [{ type: 'photo', url: photoUrl }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  let getCalls = 0;
+  let putCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const savedEnv = {
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+    R2_PREFIX: process.env.R2_PREFIX,
+    FT_MEDIA_LOCAL_ONLY_CATEGORIES: process.env.FT_MEDIA_LOCAL_ONLY_CATEGORIES,
+  };
+
+  process.env.R2_ACCOUNT_ID = 'acct';
+  process.env.R2_BUCKET = 'bucket';
+  process.env.R2_ACCESS_KEY_ID = 'access';
+  process.env.R2_SECRET_ACCESS_KEY = 'secret';
+  process.env.R2_PREFIX = 'bookmarks';
+  delete process.env.FT_MEDIA_LOCAL_ONLY_CATEGORIES;
+
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': '4', 'content-type': 'image/jpeg' },
+      });
+    }
+    if (method === 'PUT') {
+      putCalls += 1;
+      return new Response(null, { status: 200 });
+    }
+    getCalls += 1;
+    return new Response(Uint8Array.from([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      await writeFile(path.join(process.env.FT_DATA_DIR!, 'media-manifest.json'), JSON.stringify({
+        schemaVersion: 1,
+        generatedAt: '2026-04-09T00:00:00.000Z',
+        limit: 1,
+        maxBytes: 1024,
+        processed: 1,
+        downloaded: 1,
+        uploaded: 1,
+        deletedLocal: 1,
+        skippedTooLarge: 0,
+        failed: 0,
+        entries: [{
+          bookmarkId: '1',
+          tweetId: '1',
+          tweetUrl: 'https://x.com/alice/status/1',
+          sourceUrl: photoUrl,
+          r2Key: 'bookmarks/1-old.jpg',
+          r2Url: 'https://cdn.example.test/bookmarks/1-old.jpg',
+          contentType: 'image/jpeg',
+          bytes: 4,
+          status: 'downloaded',
+          fetchedAt: '2026-04-09T00:00:00.000Z',
+        }],
+      }));
+
+      const manifest = await fetchBookmarkMediaBatch({ limit: 10, maxBytes: 1024, uploadR2: true, deleteLocalAfterUpload: true });
+      const entry = manifest.entries.find((e) => e.sourceUrl === photoUrl);
+
+      assert.equal(getCalls, 1);
+      assert.equal(putCalls, 0);
+      assert.equal(entry?.storagePolicy, 'local');
+      assert.equal(entry?.r2Key, undefined);
+      assert.equal(entry?.r2Url, undefined);
+      assert.match(entry?.localPath ?? '', /1-[a-f0-9]{16}\.jpg$/);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('fetchBookmarkMediaBatch clears R2 references from existing local adult media', async () => {
+  const photoUrl = 'https://pbs.twimg.com/media/adult-both.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'adult existing local test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    possiblySensitive: true,
+    mediaObjects: [{ type: 'photo', url: photoUrl }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const savedEnv = {
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+  };
+
+  process.env.R2_ACCOUNT_ID = 'acct';
+  process.env.R2_BUCKET = 'bucket';
+  process.env.R2_ACCESS_KEY_ID = 'access';
+  process.env.R2_SECRET_ACCESS_KEY = 'secret';
+
+  globalThis.fetch = async (): Promise<Response> => {
+    fetchCalls += 1;
+    return new Response(null, { status: 500 });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      await writeFile(path.join(process.env.FT_DATA_DIR!, 'media-manifest.json'), JSON.stringify({
+        schemaVersion: 1,
+        generatedAt: '2026-04-09T00:00:00.000Z',
+        limit: 1,
+        maxBytes: 1024,
+        processed: 1,
+        downloaded: 1,
+        uploaded: 1,
+        deletedLocal: 0,
+        skippedTooLarge: 0,
+        failed: 0,
+        entries: [{
+          bookmarkId: '1',
+          tweetId: '1',
+          tweetUrl: 'https://x.com/alice/status/1',
+          sourceUrl: photoUrl,
+          localPath: '/tmp/adult-both.jpg',
+          r2Key: 'bookmarks/1-old.jpg',
+          r2Url: 'https://cdn.example.test/bookmarks/1-old.jpg',
+          contentType: 'image/jpeg',
+          bytes: 4,
+          status: 'downloaded',
+          fetchedAt: '2026-04-09T00:00:00.000Z',
+        }],
+      }));
+
+      const manifest = await fetchBookmarkMediaBatch({ limit: 10, maxBytes: 1024, uploadR2: true });
+      const entry = manifest.entries.find((e) => e.sourceUrl === photoUrl);
+
+      assert.equal(fetchCalls, 0);
+      assert.equal(entry?.storagePolicy, 'local');
+      assert.equal(entry?.r2Key, undefined);
+      assert.equal(entry?.r2Url, undefined);
+      assert.equal(entry?.localPath, '/tmp/adult-both.jpg');
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
