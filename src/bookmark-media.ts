@@ -6,6 +6,27 @@ import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksCachePath 
 import type { BookmarkRecord } from './types.js';
 
 export const DEFAULT_MEDIA_MAX_BYTES = 200 * 1024 * 1024;
+const DEFAULT_MEDIA_FETCH_TIMEOUT_MS = 60_000;
+
+function mediaFetchTimeoutMs(): number {
+  const raw = Number(process.env.FT_MEDIA_FETCH_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MEDIA_FETCH_TIMEOUT_MS;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`media request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 export interface MediaFetchEntry {
   bookmarkId: string;
@@ -348,6 +369,7 @@ export async function fetchBookmarkMediaBatch(
     ? Math.max(0, options.limit)
     : Infinity;
   const maxBytes = options.maxBytes ?? DEFAULT_MEDIA_MAX_BYTES;
+  const fetchTimeoutMs = mediaFetchTimeoutMs();
   const skipProfileImages = options.skipProfileImages ?? false;
   const r2Config = options.uploadR2 ? resolveR2Config() : null;
   const deleteLocalAfterUpload = Boolean(r2Config && options.deleteLocalAfterUpload);
@@ -472,7 +494,7 @@ export async function fetchBookmarkMediaBatch(
       const fetchedAt = new Date().toISOString();
 
       try {
-        const head = await fetch(sourceUrl, { method: 'HEAD' });
+        const head = await fetchWithTimeout(sourceUrl, { method: 'HEAD' }, fetchTimeoutMs);
         const contentLengthHeader = head.headers.get('content-length');
         const contentType = head.headers.get('content-type') ?? undefined;
         const declaredBytes = contentLengthHeader ? Number(contentLengthHeader) : undefined;
@@ -507,7 +529,7 @@ export async function fetchBookmarkMediaBatch(
           continue;
         }
 
-        const response = await fetch(sourceUrl);
+        const response = await fetchWithTimeout(sourceUrl, {}, fetchTimeoutMs);
         if (!response.ok) {
           const entry = {
             bookmarkId,
