@@ -9,7 +9,7 @@ export const DEFAULT_MEDIA_MAX_BYTES = 200 * 1024 * 1024;
 const DEFAULT_MEDIA_FETCH_TIMEOUT_MS = 60_000;
 const DEFAULT_LOCAL_ONLY_MEDIA_CATEGORIES = ['adult', 'adult art', 'nsfw', 'nudity', 'porn'];
 
-type MediaStoragePolicy = 'r2' | 'local';
+type MediaStoragePolicy = 'r2' | 'local' | 'deleted';
 
 function mediaFetchTimeoutMs(): number {
   const raw = Number(process.env.FT_MEDIA_FETCH_TIMEOUT_MS);
@@ -46,7 +46,7 @@ export interface MediaFetchEntry {
   sensitivityReason?: string;
   contentType?: string;
   bytes?: number;
-  status: 'downloaded' | 'skipped_too_large' | 'failed';
+  status: 'downloaded' | 'skipped_too_large' | 'failed' | 'deleted';
   reason?: string;
   fetchedAt: string;
 }
@@ -104,6 +104,9 @@ interface CachedMediaResult {
   localPath?: string;
   r2Key?: string;
   r2Url?: string;
+  storagePolicy?: MediaStoragePolicy;
+  sensitive?: boolean;
+  sensitivityReason?: string;
   contentType?: string;
   bytes?: number;
   status: MediaFetchEntry['status'];
@@ -372,6 +375,7 @@ function isCoveredEntry(
   requireR2: boolean,
   storagePolicy?: MediaStoragePolicy,
 ): boolean {
+  if (entry.status === 'deleted' || entry.storagePolicy === 'deleted') return true;
   if (entry.status === 'downloaded') {
     if (storagePolicy === 'local' || entry.storagePolicy === 'local') {
       return Boolean(entry.localPath) && !entry.r2Key && !entry.r2Url;
@@ -382,13 +386,26 @@ function isCoveredEntry(
   return typeof entry.bytes === 'number' && !Number.isNaN(entry.bytes) && entry.bytes > maxBytes;
 }
 
+function buildPreviousEntriesByKey(entries: MediaFetchEntry[]): Map<string, MediaFetchEntry> {
+  const out = new Map<string, MediaFetchEntry>();
+  for (const entry of entries) {
+    out.set(mediaEntryKeyFromEntry(entry), entry);
+    if (!entry.sourceUrl.includes('/profile_images/')) {
+      out.set(mediaEntryKey('', entry.sourceUrl, false), entry);
+    }
+  }
+  return out;
+}
+
 function buildCoveredAssetKeys(previous: MediaFetchManifest | null, maxBytes: number, requireR2: boolean): Set<string> {
-  return new Set(
-    (previous?.entries ?? [])
-      .filter((entry) => !entry.sourceUrl.includes('/profile_images/'))
-      .filter((entry) => isCoveredEntry(entry, maxBytes, requireR2))
-      .map((entry) => `${entry.tweetId}::${entry.sourceUrl}`),
-  );
+  const out = new Set<string>();
+  for (const entry of previous?.entries ?? []) {
+    if (entry.sourceUrl.includes('/profile_images/')) continue;
+    if (!isCoveredEntry(entry, maxBytes, requireR2)) continue;
+    out.add(mediaEntryKey(entry.tweetId, entry.sourceUrl, false));
+    out.add(mediaEntryKey('', entry.sourceUrl, false));
+  }
+  return out;
 }
 
 function buildCoveredProfileImageUrls(previous: MediaFetchManifest | null, maxBytes: number, requireR2: boolean): Set<string> {
@@ -411,9 +428,11 @@ function hasPendingMediaTarget(
 ): boolean {
   return resolveMediaTargets(bookmark, coveredProfileImageUrls, skipProfileImages).some(({ tweetId, sourceUrl, isProfileImage, storagePolicy }) => {
     if (isProfileImage) return true;
-    const previousEntry = previousEntriesByKey.get(mediaEntryKey(tweetId, sourceUrl, isProfileImage));
+    const previousEntry = previousEntriesByKey.get(mediaEntryKey(tweetId, sourceUrl, isProfileImage))
+      ?? (!isProfileImage ? previousEntriesByKey.get(mediaEntryKey('', sourceUrl, false)) : undefined);
     if (previousEntry && !isCoveredEntry(previousEntry, maxBytes, requireR2, storagePolicy)) return true;
-    return !coveredAssetKeys.has(`${tweetId}::${sourceUrl}`);
+    return !coveredAssetKeys.has(mediaEntryKey(tweetId, sourceUrl, false))
+      && !coveredAssetKeys.has(mediaEntryKey('', sourceUrl, false));
   });
 }
 
@@ -440,7 +459,7 @@ export async function fetchBookmarkMediaBatch(
   await ensureDir(mediaDir);
 
   const previous = await loadManifest();
-  const previousEntriesByKey = new Map((previous?.entries ?? []).map((entry) => [mediaEntryKeyFromEntry(entry), entry]));
+  const previousEntriesByKey = buildPreviousEntriesByKey(previous?.entries ?? []);
   const coveredAssetKeys = buildCoveredAssetKeys(previous, maxBytes, Boolean(r2Config));
   const coveredProfileImageUrls = buildCoveredProfileImageUrls(previous, maxBytes, Boolean(r2Config));
   const bookmarks = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
@@ -448,7 +467,7 @@ export async function fetchBookmarkMediaBatch(
     .filter(hasMediaCandidate)
     .filter((bookmark) => hasPendingMediaTarget(bookmark, previousEntriesByKey, coveredAssetKeys, coveredProfileImageUrls, maxBytes, Boolean(r2Config), skipProfileImages))
     .slice(0, limit);
-  const entriesByKey = new Map(previousEntriesByKey);
+  const entriesByKey = new Map((previous?.entries ?? []).map((entry) => [mediaEntryKeyFromEntry(entry), entry]));
   const cachedResultsBySourceUrl = new Map<string, CachedMediaResult>();
   for (const entry of previous?.entries ?? []) {
     if (!entry.sourceUrl || entry.sourceUrl.includes('/profile_images/')) continue;
@@ -458,6 +477,9 @@ export async function fetchBookmarkMediaBatch(
         localPath: entry.localPath,
         r2Key: entry.r2Key,
         r2Url: entry.r2Url,
+        storagePolicy: entry.storagePolicy,
+        sensitive: entry.sensitive,
+        sensitivityReason: entry.sensitivityReason,
         contentType: entry.contentType,
         bytes: entry.bytes,
         status: entry.status,
@@ -510,7 +532,8 @@ export async function fetchBookmarkMediaBatch(
   ): void => {
     const { bookmarkId, tweetId, tweetUrl, authorHandle, authorName, sourceUrl, isProfileImage, storagePolicy, sensitivityReason } = target;
     if (isProfileImage) return;
-    const localOnly = storagePolicy === 'local';
+    const deleted = cached.status === 'deleted' || cached.storagePolicy === 'deleted';
+    const localOnly = !deleted && storagePolicy === 'local';
     upsertEntry({
       bookmarkId,
       tweetId,
@@ -521,9 +544,9 @@ export async function fetchBookmarkMediaBatch(
       localPath: cached.localPath,
       r2Key: localOnly ? undefined : cached.r2Key,
       r2Url: localOnly ? undefined : cached.r2Url,
-      storagePolicy,
-      sensitive: localOnly ? true : undefined,
-      sensitivityReason,
+      storagePolicy: deleted ? 'deleted' : storagePolicy,
+      sensitive: deleted ? true : localOnly ? true : undefined,
+      sensitivityReason: deleted ? cached.sensitivityReason ?? 'human reviewed deleted' : sensitivityReason,
       contentType: cached.contentType,
       bytes: cached.bytes,
       status: cached.status,
@@ -536,6 +559,9 @@ export async function fetchBookmarkMediaBatch(
     } else if (cached.status === 'skipped_too_large') {
       coveredAssetKeys.add(key);
       skippedTooLarge += 1;
+    } else if (cached.status === 'deleted') {
+      coveredAssetKeys.add(key);
+      coveredAssetKeys.add(mediaEntryKey('', sourceUrl, false));
     } else {
       failed += 1;
     }
@@ -562,7 +588,7 @@ export async function fetchBookmarkMediaBatch(
       } = target;
       const localOnly = storagePolicy === 'local';
       const key = mediaEntryKey(tweetId, sourceUrl, isProfileImage);
-      if (!isProfileImage && coveredAssetKeys.has(key)) {
+      if (!isProfileImage && (coveredAssetKeys.has(key) || coveredAssetKeys.has(mediaEntryKey('', sourceUrl, false)))) {
         const previousEntry = entriesByKey.get(key);
         if (!localOnly || (previousEntry && isCoveredEntry(previousEntry, maxBytes, Boolean(r2Config), 'local'))) {
           continue;

@@ -1213,3 +1213,82 @@ test('fetchBookmarkMediaBatch clears R2 references from existing local adult med
     }
   }
 });
+
+test('fetchBookmarkMediaBatch does not refetch deleted shared media entries', async () => {
+  const photoUrl = 'https://pbs.twimg.com/media/adult-deleted.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'deleted media test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    mediaObjects: [{ type: 'photo', url: photoUrl }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const savedEnv = {
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+  };
+
+  process.env.R2_ACCOUNT_ID = 'acct';
+  process.env.R2_BUCKET = 'bucket';
+  process.env.R2_ACCESS_KEY_ID = 'access';
+  process.env.R2_SECRET_ACCESS_KEY = 'secret';
+
+  globalThis.fetch = async (): Promise<Response> => {
+    fetchCalls += 1;
+    return new Response(null, { status: 500 });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      await writeFile(path.join(process.env.FT_DATA_DIR!, 'media-manifest.json'), JSON.stringify({
+        schemaVersion: 1,
+        generatedAt: '2026-04-09T00:00:00.000Z',
+        limit: 1,
+        maxBytes: 1024,
+        processed: 1,
+        downloaded: 0,
+        uploaded: 0,
+        deletedLocal: 0,
+        skippedTooLarge: 0,
+        failed: 0,
+        entries: [{
+          bookmarkId: 'shared',
+          tweetId: 'shared',
+          tweetUrl: '',
+          sourceUrl: photoUrl,
+          storagePolicy: 'deleted',
+          sensitive: true,
+          sensitivityReason: 'human reviewed deleted',
+          status: 'deleted',
+          fetchedAt: '2026-04-09T00:00:00.000Z',
+        }],
+      }));
+
+      const manifest = await fetchBookmarkMediaBatch({ limit: 10, maxBytes: 1024, uploadR2: true });
+      const entry = manifest.entries.find((e) => e.sourceUrl === photoUrl);
+
+      assert.equal(fetchCalls, 0);
+      assert.equal(entry?.storagePolicy, 'deleted');
+      assert.equal(entry?.status, 'deleted');
+      assert.equal(entry?.localPath, undefined);
+      assert.equal(entry?.r2Key, undefined);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
