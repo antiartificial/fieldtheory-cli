@@ -1,6 +1,7 @@
 import path from 'node:path';
-import { createHash, createHmac } from 'node:crypto';
-import { readdir, rm, writeFile } from 'node:fs/promises';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { open, readdir, rename, rm } from 'node:fs/promises';
 import { ensureDir, pathExists, readJson, readJsonLines, writeJson } from './fs.js';
 import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksCachePath } from './paths.js';
 import type { BookmarkRecord } from './types.js';
@@ -124,6 +125,95 @@ interface R2UploadConfig {
   prefix: string;
 }
 
+interface DownloadedMedia {
+  tempPath: string;
+  contentType?: string;
+  bytes: number;
+  payloadHash: string;
+}
+
+class MediaTooLargeError extends Error {
+  constructor(
+    readonly bytes: number,
+    readonly maxBytes: number,
+    readonly contentType?: string,
+  ) {
+    super(`downloaded size ${bytes} exceeds max ${maxBytes}`);
+    this.name = 'MediaTooLargeError';
+  }
+}
+
+async function downloadMediaToTemp(
+  sourceUrl: string,
+  mediaDir: string,
+  maxBytes: number,
+  idleTimeoutMs: number,
+  fallbackContentType?: string,
+): Promise<DownloadedMedia> {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const armIdleTimeout = (): void => {
+    if (timeout) clearTimeout(timeout);
+    timeout = setTimeout(() => controller.abort(), idleTimeoutMs);
+  };
+
+  const tempPath = path.join(mediaDir, `.download-${process.pid}-${randomUUID()}.tmp`);
+  let file: Awaited<ReturnType<typeof open>> | undefined;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let completed = false;
+
+  try {
+    armIdleTimeout();
+    const response = await fetch(sourceUrl, { signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.body) throw new Error('media response had no body');
+
+    const contentType = response.headers.get('content-type') ?? fallbackContentType;
+    const hash = createHash('sha256');
+    let bytes = 0;
+    file = await open(tempPath, 'wx', 0o600);
+    reader = response.body.getReader();
+
+    while (true) {
+      armIdleTimeout();
+      const { done, value } = await reader.read();
+      if (done) break;
+      armIdleTimeout();
+      bytes += value.byteLength;
+      if (bytes > maxBytes) throw new MediaTooLargeError(bytes, maxBytes, contentType);
+      hash.update(value);
+      let offset = 0;
+      while (offset < value.byteLength) {
+        const { bytesWritten } = await file.write(value, offset, value.byteLength - offset, null);
+        if (bytesWritten === 0) throw new Error('media download made no progress writing to disk');
+        offset += bytesWritten;
+      }
+    }
+
+    await file.close();
+    file = undefined;
+    completed = true;
+    return {
+      tempPath,
+      contentType,
+      bytes,
+      payloadHash: hash.digest('hex'),
+    };
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`media request stalled for ${Math.round(idleTimeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (file) await file.close().catch(() => undefined);
+    if (!completed) {
+      await reader?.cancel().catch(() => undefined);
+      await rm(tempPath, { force: true }).catch(() => undefined);
+    }
+  }
+}
+
 function mediaEntryKey(tweetId: string, sourceUrl: string, isProfileImage: boolean): string {
   return isProfileImage ? `profile::${sourceUrl}` : `${tweetId}::${sourceUrl}`;
 }
@@ -207,15 +297,22 @@ function encodeS3Key(key: string): string {
   return key.split('/').map(encodeS3PathPart).join('/');
 }
 
-async function uploadToR2(config: R2UploadConfig, key: string, body: Buffer, contentType?: string): Promise<string> {
+async function uploadToR2(
+  config: R2UploadConfig,
+  key: string,
+  filePath: string,
+  payloadHash: string,
+  contentLength: number,
+  contentType?: string,
+): Promise<string> {
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
   const dateStamp = amzDate.slice(0, 8);
-  const payloadHash = createHash('sha256').update(body).digest('hex');
   const encodedKey = encodeS3Key(key);
   const url = new URL(`${config.endpoint}/${encodeS3PathPart(config.bucket)}/${encodedKey}`);
   const host = url.host;
   const headers: Record<string, string> = {
+    'content-length': String(contentLength),
     host,
     'x-amz-content-sha256': payloadHash,
     'x-amz-date': amzDate,
@@ -244,7 +341,12 @@ async function uploadToR2(config: R2UploadConfig, key: string, body: Buffer, con
   const signature = createHmac('sha256', signingKey).update(stringToSign).digest('hex');
   headers.authorization = `AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
-  const response = await fetch(url, { method: 'PUT', headers, body: new Uint8Array(body) });
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers,
+    body: createReadStream(filePath) as unknown as BodyInit,
+    duplex: 'half',
+  } as RequestInit & { duplex: 'half' });
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
     throw new Error(`R2 upload failed HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`);
@@ -641,8 +743,11 @@ export async function fetchBookmarkMediaBatch(
           continue;
         }
 
-        const response = await fetchWithTimeout(sourceUrl, {}, fetchTimeoutMs);
-        if (!response.ok) {
+        let media: DownloadedMedia;
+        try {
+          media = await downloadMediaToTemp(sourceUrl, mediaDir, maxBytes, fetchTimeoutMs, contentType);
+        } catch (error) {
+          if (!(error instanceof MediaTooLargeError)) throw error;
           const entry = {
             bookmarkId,
             tweetId,
@@ -650,47 +755,19 @@ export async function fetchBookmarkMediaBatch(
             authorHandle,
             authorName,
             sourceUrl,
-            storagePolicy,
-            sensitive: localOnly ? true : undefined,
-            sensitivityReason,
-            status: 'failed',
-            reason: `HTTP ${response.status}`,
-            fetchedAt,
-          } satisfies MediaFetchEntry;
-          upsertEntry(entry);
-          cachedResultsBySourceUrl.set(sourceUrl, {
-            status: entry.status,
-            reason: entry.reason,
-            fetchedAt,
-          });
-          failed += 1;
-          processed += 1;
-          emitProgress(sourceUrl);
-          continue;
-        }
-
-        const buffer = Buffer.from(await response.arrayBuffer());
-        if (buffer.byteLength > maxBytes) {
-          const entry = {
-            bookmarkId,
-            tweetId,
-            tweetUrl,
-            authorHandle,
-            authorName,
-            sourceUrl,
-            contentType: response.headers.get('content-type') ?? contentType ?? undefined,
-            bytes: buffer.byteLength,
+            contentType: error.contentType ?? contentType,
+            bytes: error.bytes,
             storagePolicy,
             sensitive: localOnly ? true : undefined,
             sensitivityReason,
             status: 'skipped_too_large',
-            reason: `downloaded size ${buffer.byteLength} exceeds max ${maxBytes}`,
+            reason: error.message,
             fetchedAt,
           } satisfies MediaFetchEntry;
           upsertEntry(entry);
           cachedResultsBySourceUrl.set(sourceUrl, {
             contentType: entry.contentType,
-            bytes: buffer.byteLength,
+            bytes: entry.bytes,
             status: entry.status,
             reason: entry.reason,
             fetchedAt,
@@ -703,16 +780,18 @@ export async function fetchBookmarkMediaBatch(
           continue;
         }
 
-        const digest = createHash('sha256').update(buffer).digest('hex').slice(0, 16);
-        const ext = sanitizeExtFromContentType(response.headers.get('content-type') ?? contentType ?? undefined, sourceUrl);
+        const digest = media.payloadHash.slice(0, 16);
+        const ext = sanitizeExtFromContentType(media.contentType, sourceUrl);
         const digestKey = `${digest}${ext}`;
         const existingPath = existingDigestIndex.get(digestKey);
         const filename = isProfileImage
           ? digestKey
           : `${tweetId}-${digestKey}`;
         const localPath = existingPath ?? path.join(mediaDir, filename);
-        if (!existingPath) {
-          await writeFile(localPath, buffer);
+        if (existingPath) {
+          await rm(media.tempPath, { force: true });
+        } else {
+          await rename(media.tempPath, localPath);
           existingDigestIndex.set(digestKey, localPath);
         }
         let finalLocalPath: string | undefined = localPath;
@@ -720,7 +799,7 @@ export async function fetchBookmarkMediaBatch(
         let r2Url: string | undefined;
         if (r2Config && !localOnly) {
           r2Key = `${r2Config.prefix}/${filename}`;
-          r2Url = await uploadToR2(r2Config, r2Key, buffer, response.headers.get('content-type') ?? contentType ?? undefined);
+          r2Url = await uploadToR2(r2Config, r2Key, localPath, media.payloadHash, media.bytes, media.contentType);
           uploaded += 1;
           if (deleteLocalAfterUpload) {
             await rm(localPath, { force: true });
@@ -745,8 +824,8 @@ export async function fetchBookmarkMediaBatch(
           storagePolicy,
           sensitive: localOnly ? true : undefined,
           sensitivityReason,
-          contentType: response.headers.get('content-type') ?? contentType ?? undefined,
-          bytes: buffer.byteLength,
+          contentType: media.contentType,
+          bytes: media.bytes,
           status: 'downloaded',
           fetchedAt,
         } satisfies MediaFetchEntry;
@@ -756,7 +835,7 @@ export async function fetchBookmarkMediaBatch(
           r2Key,
           r2Url,
           contentType: entry.contentType,
-          bytes: buffer.byteLength,
+          bytes: media.bytes,
           status: entry.status,
           fetchedAt,
         });

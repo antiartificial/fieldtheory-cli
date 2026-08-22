@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -75,6 +75,54 @@ test('fetchBookmarkMediaBatch downloads post media from GraphQL mediaObjects sha
         videoPosterUrl,
         videoUrl,
       ].sort());
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchBookmarkMediaBatch streams media to disk and enforces the byte limit without a content-length', async () => {
+  const photoUrl = 'https://pbs.twimg.com/media/chunked-large.jpg';
+  const records = [{
+    id: '1',
+    tweetId: '1',
+    url: 'https://x.com/alice/status/1',
+    text: 'chunked media test',
+    authorHandle: 'alice',
+    authorName: 'Alice',
+    syncedAt: '2026-04-09T00:00:00.000Z',
+    mediaObjects: [{ type: 'photo', url: photoUrl }],
+    links: [],
+    tags: [],
+    ingestedVia: 'graphql',
+  }];
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    if (init?.method === 'HEAD') {
+      return new Response(null, { status: 200, headers: { 'content-type': 'image/jpeg' } });
+    }
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(Uint8Array.from([1, 2, 3, 4]));
+        controller.enqueue(Uint8Array.from([5, 6, 7, 8]));
+        controller.close();
+      },
+    });
+    return new Response(body, { status: 200, headers: { 'content-type': 'image/jpeg' } });
+  };
+
+  try {
+    await withMediaDataDir(records, async () => {
+      const manifest = await fetchBookmarkMediaBatch({ limit: 10, maxBytes: 6, skipProfileImages: true });
+      const entry = manifest.entries.find((candidate) => candidate.sourceUrl === photoUrl);
+
+      assert.equal(manifest.skippedTooLarge, 1);
+      assert.equal(manifest.failed, 0);
+      assert.equal(entry?.status, 'skipped_too_large');
+      assert.equal(entry?.bytes, 8);
+      assert.match(entry?.reason ?? '', /downloaded size 8 exceeds max 6/);
+      assert.deepEqual(await readdir(path.join(process.env.FT_DATA_DIR!, 'media')), []);
     });
   } finally {
     globalThis.fetch = originalFetch;
@@ -721,6 +769,7 @@ test('fetchBookmarkMediaBatch uploads to R2 and deletes local files after succes
   }];
 
   const uploadedUrls: string[] = [];
+  const uploadedBodies: Buffer[] = [];
   const originalFetch = globalThis.fetch;
   const savedEnv = {
     R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
@@ -750,6 +799,11 @@ test('fetchBookmarkMediaBatch uploads to R2 and deletes local files after succes
     if (method === 'PUT') {
       uploadedUrls.push(url);
       assert.ok(init?.headers && 'authorization' in (init.headers as Record<string, string>));
+      const chunks: Buffer[] = [];
+      for await (const chunk of init?.body as unknown as AsyncIterable<Uint8Array>) {
+        chunks.push(Buffer.from(chunk));
+      }
+      uploadedBodies.push(Buffer.concat(chunks));
       return new Response(null, { status: 200 });
     }
     return new Response(Uint8Array.from([1, 2, 3, 4]), {
@@ -775,6 +829,7 @@ test('fetchBookmarkMediaBatch uploads to R2 and deletes local files after succes
       assert.match(entry?.r2Key ?? '', /^bookmarks\/1-[a-f0-9]{16}\.jpg$/);
       assert.match(entry?.r2Url ?? '', /^https:\/\/cdn\.example\.test\/media\/bookmarks\/1-[a-f0-9]{16}\.jpg$/);
       assert.equal(uploadedUrls.length, 1);
+      assert.deepEqual(uploadedBodies, [Buffer.from([1, 2, 3, 4])]);
 
       const mediaDirEntries = await readFile(path.join(process.env.FT_DATA_DIR!, 'media-manifest.json'), 'utf8');
       assert.match(mediaDirEntries, /"r2Key"/);
