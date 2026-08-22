@@ -754,6 +754,7 @@ export function buildCli() {
     .option('--yes', 'Skip confirmation prompts', false)
     .option('--classify', 'Classify new bookmarks with LLM after syncing', false)
     .option('--no-media', 'Skip downloading media assets after syncing (default: media is downloaded)')
+    .option('--media-limit <n>', 'Max bookmark candidates in the post-sync media batch (default: unlimited)', (v: string) => Number(v))
     .option('--media-max-bytes <n>', 'Per-asset byte limit for media downloads (default: 200 MB)', (v: string) => Number(v), DEFAULT_MEDIA_MAX_BYTES)
     .option('--media-r2', 'Upload downloaded media assets to Cloudflare R2')
     .option('--media-delete-local', 'Delete local media files after successful R2 upload')
@@ -810,12 +811,16 @@ export function buildCli() {
         // Commander sets options.media=false when --no-media is passed;
         // otherwise it's true by default.
         const downloadMedia = options.media !== false;
+        const mediaLimit = typeof options.mediaLimit === 'number' && !Number.isNaN(options.mediaLimit)
+          ? Math.max(0, options.mediaLimit)
+          : undefined;
         const mediaMaxBytes = typeof options.mediaMaxBytes === 'number' && !Number.isNaN(options.mediaMaxBytes)
           ? options.mediaMaxBytes
           : DEFAULT_MEDIA_MAX_BYTES;
         const postSyncMediaFetch = async (): Promise<void> => {
           if (!downloadMedia) return;
           await runMediaFetchWithProgress({
+            limit: mediaLimit,
             maxBytes: mediaMaxBytes,
             skipProfileImages: Boolean(options.skipProfileImages),
             uploadR2: Boolean(options.mediaR2),

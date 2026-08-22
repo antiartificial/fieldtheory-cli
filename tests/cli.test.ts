@@ -92,7 +92,7 @@ test('ft install app command is registered', () => {
   assert.ok(opts.includes('--json'));
 });
 
-test('ft sync: media is on by default and exposes --no-media', () => {
+test('ft sync: media is on by default and exposes bounded media controls', () => {
   const program = buildCli();
   const syncCmd = program.commands.find((c: any) => c.name() === 'sync');
   assert.ok(syncCmd, 'sync command should be registered');
@@ -103,6 +103,8 @@ test('ft sync: media is on by default and exposes --no-media', () => {
   assert.ok(mediaOption, 'a media option must be registered');
   assert.equal(mediaOption.negate, true, 'the media option must be --no-media (negated)');
   assert.equal(mediaOption.long, '--no-media');
+  assert.ok(syncCmd.options.some((option: any) => option.long === '--media-limit'));
+  assert.ok(syncCmd.options.some((option: any) => option.long === '--media-max-bytes'));
 });
 
 test('ft wiki: description mentions engine prerequisite', () => {
